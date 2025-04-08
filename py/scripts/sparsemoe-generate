@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import json
+import torch
+import torch.distributed as dist
+from transformers import AutoTokenizer
+
+from sparsemoe import create_model, SparseMoEConfig
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run inference with SparseMoE models")
+    
+    # Model configuration
+    parser.add_argument("--model-size", type=str, default="16B", 
+                        choices=["16B", "236B", "671B", "1024B"],
+                        help="Model size: Base(16B), Plus(236B), Pro(671B), or Ultra(1024B)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model configuration file")
+    parser.add_argument("--ckpt-path", type=str, required=True,
+                        help="Path to model checkpoint")
+    parser.add_argument("--tokenizer-path", type=str, default=None,
+                        help="Path to tokenizer (defaults to gpt2)")
+    
+    # Generation settings
+    parser.add_argument("--max-new-tokens", type=int, default=200,
+                        help="Maximum number of new tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature (0 for greedy decoding)")
+    parser.add_argument("--top-p", type=float, default=0.95,
+                        help="Top-p sampling parameter")
+    
+    # Input/output options
+    parser.add_argument("--interactive", action="store_true",
+                        help="Run in interactive mode")
+    parser.add_argument("--input-file", type=str, default=None,
+                        help="Path to input file (one prompt per line)")
+    parser.add_argument("--output-file", type=str, default=None,
+                        help="Path to output file")
+    
+    # Performance options
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Batch size for processing")
+    parser.add_argument("--cpu-only", action="store_true",
+                        help="Use Python-only implementation without C++ backend")
+    
+    return parser.parse_args()
+
+def setup_distributed():
+    """Set up distributed environment if needed."""
+    if torch.cuda.is_available():
+        if "WORLD_SIZE" in os.environ:
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+            dist.init_process_group(backend="nccl")
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        else:
+            world_size = 1
+            rank = 0
+    else:
+        world_size = 1
+        rank = 0
+    
+    return world_size, rank
+
+def generate_response(model, tokenizer, prompt, args, device):
+    """Generate a response for a single prompt."""
+    # Tokenize the prompt
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    
+    # Generate response
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids, 
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p
+        )
+    
+    # Decode the generated tokens
+    generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+    
+    return generated_text
+
+def interactive_mode(model, tokenizer, args, world_size, rank, device):
+    """Run the model in interactive chat mode."""
+    if rank == 0:
+        print("\nSparseMoE Interactive Mode")
+        print("Type '/exit' to quit, '/clear' to reset conversation\n")
+    
+    messages = []
+    
+    while True:
+        # Get input from the user (only on rank 0)
+        if world_size > 1:
+            if rank == 0:
+                user_input = input(">>> ")
+                # Broadcast input to all processes
+                objects = [user_input]
+                dist.broadcast_object_list(objects, src=0)
+                user_input = objects[0]
+            else:
+                objects = [None]
+                dist.broadcast_object_list(objects, src=0)
+                user_input = objects[0]
+        else:
+            user_input = input(">>> ")
+        
+        # Check for exit command
+        if user_input.strip() == "/exit":
+            break
+        
+        # Check for clear command
+        if user_input.strip() == "/clear":
+            messages = []
+            if rank == 0:
+                print("Conversation cleared")
+            continue
+        
+        # Add user message
+        messages.append({"role": "user", "content": user_input})
+        
+        # Format messages into prompt (using chat template if available)
+        if hasattr(tokenizer, "apply_chat_template"):
+            prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        else:
+            # Simple fallback format if chat template not available
+            prompt = "\n\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in messages])
+            prompt += "\n\nASSISTANT: "
+        
+        # Generate response
+        response = generate_response(model, tokenizer, prompt, args, device)
+        
+        # Only print on rank 0
+        if rank == 0:
+            print(response)
+        
+        # Add assistant message
+        messages.append({"role": "assistant", "content": response})
+
+def batch_mode(model, tokenizer, args, world_size, rank, device):
+    """Process a batch of prompts from a file."""
+    # Read input file
+    with open(args.input_file, "r", encoding="utf-8") as f:
+        prompts = [line.strip() for line in f if line.strip()]
+    
+    # Process prompts in batches
+    responses = []
+    for i in range(0, len(prompts), args.batch_size):
+        batch_prompts = prompts[i:i+args.batch_size]
+        
+        # Only print on rank 0
+        if rank == 0:
+            print(f"Processing prompts {i+1}-{i+len(batch_prompts)} of {len(prompts)}")
+        
+        batch_responses = []
+        for prompt in batch_prompts:
+            response = generate_response(model, tokenizer, prompt, args, device)
+            batch_responses.append(response)
+        
+        responses.extend(batch_responses)
+    
+    # Write output if requested
+    if args.output_file and rank == 0:
+        with open(args.output_file, "w", encoding="utf-8") as f:
+            for prompt, response in zip(prompts, responses):
+                f.write(f"PROMPT: {prompt}\n")
+                f.write(f"RESPONSE: {response}\n\n")
+    
+    # Print results on rank 0
+    if rank == 0:
+        for i, (prompt, response) in enumerate(zip(prompts, responses)):
+            print(f"\n--- Result {i+1} ---")
+            print(f"Prompt: {prompt}")
+            print(f"Response: {response}")
+
+def main():
+    args = parse_args()
+    
+    # Validate arguments
+    if not args.interactive and not args.input_file:
+        print("Error: Must specify either --interactive or --input-file")
+        sys.exit(1)
+    
+    # Set up distributed environment
+    world_size, rank = setup_distributed()
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create model
+    model = create_model(
+        config_path=args.config, 
+        model_size=args.model_size,
+        use_cpp_backend=not args.cpu_only
+    )
+    
+    # Load model weights
+    model.load_weights(args.ckpt_path)
+    model = model.to(device)
+    model.eval()
+    
+    # Load tokenizer
+    tokenizer_path = args.tokenizer_path or "gpt2"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    
+    # Run in appropriate mode
+    if args.interactive:
+        interactive_mode(model, tokenizer, args, world_size, rank, device)
+    else:
+        batch_mode(model, tokenizer, args, world_size, rank, device)
+    
+    # Clean up distributed environment
+    if world_size > 1:
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()

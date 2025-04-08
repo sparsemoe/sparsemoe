@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import torch
+import torch.distributed as dist
+from transformers import AutoTokenizer, get_scheduler
+
+from sparsemoe import create_model, SparseMoEConfig
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train SparseMoE models")
+    parser.add_argument("--model-size", type=str, default="16B", 
+                        choices=["16B", "236B", "671B", "1024B"],
+                        help="Model size: Base(16B), Plus(236B), Pro(671B), or Ultra(1024B)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model configuration file")
+    parser.add_argument("--data-path", type=str, required=True,
+                        help="Path to the training data (jsonl format)")
+    parser.add_argument("--output-dir", type=str, required=True,
+                        help="Directory to save the model checkpoints")
+    parser.add_argument("--pretrained-path", type=str, default=None,
+                        help="Path to pretrained model weights (optional)")
+    parser.add_argument("--tokenizer-path", type=str, default=None,
+                        help="Path to tokenizer (defaults to gpt2)")
+    
+    # Training parameters
+    parser.add_argument("--learning-rate", type=float, default=1e-5,
+                        help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Batch size per GPU")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Number of updates steps to accumulate")
+    parser.add_argument("--max-steps", type=int, default=100000,
+                        help="Total number of training steps")
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="Number of warmup steps for learning rate scheduler")
+    parser.add_argument("--weight-decay", type=float, default=0.01,
+                        help="Weight decay")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+    
+    # Mixed precision training
+    parser.add_argument("--fp16", action="store_true",
+                        help="Whether to use mixed precision training")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Whether to use bfloat16 mixed precision training")
+    
+    # CPU vs. C++ backend
+    parser.add_argument("--cpu-only", action="store_true",
+                        help="Use Python-only implementation without C++ backend")
+    
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(args.seed)
+    
+    # Initialize distributed training
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+    dist.init_process_group(backend="nccl")
+    
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create model
+    model = create_model(
+        config_path=args.config, 
+        model_size=args.model_size,
+        use_cpp_backend=not args.cpu_only
+    )
+    
+    # Load pretrained weights if provided
+    if args.pretrained_path:
+        model.load_weights(args.pretrained_path)
+    
+    model = model.to(device)
+    
+    # Initialize distributed data parallel
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, 
+        device_ids=[device] if torch.cuda.is_available() else None,
+        output_device=device if torch.cuda.is_available() else None
+    )
+    
+    # Initialize tokenizer
+    tokenizer_path = args.tokenizer_path or "gpt2"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    
+    # Create dataset and dataloader
+    # (This would typically use a custom dataset class for your specific data format)
+    
+    # Initialize optimizer
+    no_decay = ["bias", "layernorm", "norm"]
+    optimizer_grouped_params = [
+        {
+            "params": [p for n, p in model.named_parameters() 
+                      if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() 
+                      if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_params, 
+        lr=args.learning_rate
+    )
+    
+    # Initialize learning rate scheduler
+    lr_scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.max_steps,
+    )
+    
+    # Initialize mixed precision training
+    if args.fp16 or args.bf16:
+        amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+        scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    else:
+        scaler = None
+    
+    # Training loop
+    if rank == 0:
+        print(f"Starting training with model size {args.model_size}")
+        print(f"Using {'C++' if not args.cpu_only else 'Python-only'} backend")
+    
+    # This is a placeholder - in a real implementation, you would:
+    # 1. Load data from args.data_path
+    # 2. Implement the training loop with gradient accumulation
+    # 3. Save checkpoints periodically
+    # 4. Log metrics
+    
+    if rank == 0:
+        print(f"Training completed successfully")
+        
+if __name__ == "__main__":
+    main()
