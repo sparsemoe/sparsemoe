@@ -1,13 +1,14 @@
 import os
 import json
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Union, Tuple
+from typing import Optional, Dict, List, Union, Tuple, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .dnps import DNPSLayer
+from .adaptive_experts import AdaptiveExpertLayer
 
 @dataclass
 class SparseMoEConfig:
@@ -35,6 +36,15 @@ class SparseMoEConfig:
     max_batch_size: int = 8
     use_cpp_backend: bool = True
     eos_token_id: int = 2
+    
+    # Adaptive expert configuration
+    use_adaptive_experts: bool = False  # Whether to use the adaptive expert mechanism
+    adaptive_initial_dim: int = 2048    # Initial hidden dimension for adaptive experts
+    adaptive_min_dim: int = 512         # Minimum hidden dimension for adaptive experts
+    adaptive_max_dim: int = 4096        # Maximum hidden dimension for adaptive experts
+    adaptive_scaling_interval: int = 1000  # How often to check for expert rescaling
+    adaptive_router_capacity: float = 1.5  # Router capacity factor
+    expert_type: Literal["fixed", "adaptive"] = "fixed"  # Type of expert to use
     
     @classmethod
     def from_json(cls, path: str) -> "SparseMoEConfig":
@@ -240,13 +250,13 @@ class DynamicAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Transformer block with attention and DNPS layers."""
+    """Transformer block with attention and expert layers."""
     
     def __init__(self, layer_id: int, config: SparseMoEConfig):
         super().__init__()
         self.attn = DynamicAttention(config)
         
-        # For first few layers, use MLP instead of DNPS
+        # For first few layers, use MLP instead of expert layers
         if layer_id < config.n_dense_layers:
             self.ffn = nn.Sequential(
                 nn.Linear(config.dim, config.inter_dim, bias=False),
@@ -254,17 +264,32 @@ class TransformerBlock(nn.Module):
                 nn.Linear(config.inter_dim, config.dim, bias=False)
             )
         else:
-            self.ffn = DNPSLayer(
-                dim=config.dim,
-                num_experts=config.n_routed_experts,
-                num_selected=config.n_activated_experts,
-                group_size=config.n_expert_groups,
-                score_func=config.score_func,
-                route_scale=config.route_scale,
-                moe_dim=config.moe_inter_dim,
-                num_shared_experts=config.n_shared_experts,
-                use_cpp_backend=config.use_cpp_backend
-            )
+            # Choose expert type based on configuration
+            if config.expert_type == "adaptive":
+                # Use adaptive experts with dynamic scaling
+                self.ffn = AdaptiveExpertLayer(
+                    dim=config.dim,
+                    num_experts=config.n_routed_experts,
+                    num_selected=config.n_activated_experts,
+                    initial_expert_dim=config.adaptive_initial_dim,
+                    min_expert_dim=config.adaptive_min_dim,
+                    max_expert_dim=config.adaptive_max_dim,
+                    scaling_interval=config.adaptive_scaling_interval,
+                    router_capacity_factor=config.adaptive_router_capacity
+                )
+            else:
+                # Use standard fixed-size experts
+                self.ffn = DNPSLayer(
+                    dim=config.dim,
+                    num_experts=config.n_routed_experts,
+                    num_selected=config.n_activated_experts,
+                    group_size=config.n_expert_groups,
+                    score_func=config.score_func,
+                    route_scale=config.route_scale,
+                    moe_dim=config.moe_inter_dim,
+                    num_shared_experts=config.n_shared_experts,
+                    use_cpp_backend=config.use_cpp_backend
+                )
         
         # Layer normalization
         self.attn_norm = RMSNorm(config.dim)
@@ -418,3 +443,120 @@ class SparseMoEModel(nn.Module):
     def save_weights(self, path: str) -> None:
         """Save model weights to a file."""
         torch.save(self.state_dict(), path)
+        
+    def get_expert_stats(self) -> Dict:
+        """
+        Get statistics about experts in the model, including adaptive expert metrics.
+        
+        Returns:
+            Dictionary containing expert statistics for each layer
+        """
+        stats = {}
+        
+        for i, layer in enumerate(self.layers):
+            # Skip dense layers
+            if i < self.config.n_dense_layers:
+                continue
+                
+            # Check if this layer uses adaptive experts
+            if hasattr(layer.ffn, 'get_expert_stats'):
+                stats[f'layer_{i}'] = layer.ffn.get_expert_stats()
+            elif hasattr(layer.ffn, 'experts'):
+                # Basic stats for regular DNPSLayer
+                stats[f'layer_{i}'] = {
+                    "num_experts": len(layer.ffn.experts),
+                    "expert_type": "fixed"
+                }
+                
+        return stats
+    
+    def visualize_expert_scaling(self, layer_idx: int = None):
+        """
+        Visualize how experts have been scaled over time.
+        Requires matplotlib to be installed.
+        
+        Args:
+            layer_idx: Optional index of specific layer to visualize. If None, visualizes all adaptive layers.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+        except ImportError:
+            print("Matplotlib is required for visualization. Please install with 'pip install matplotlib'")
+            return
+            
+        stats = self.get_expert_stats()
+        
+        if not stats:
+            print("No adaptive expert layers found in the model.")
+            return
+            
+        if layer_idx is not None:
+            layer_key = f'layer_{layer_idx}'
+            if layer_key not in stats:
+                print(f"Layer {layer_idx} does not exist or does not use adaptive experts.")
+                return
+                
+            layers_to_plot = {layer_key: stats[layer_key]}
+        else:
+            layers_to_plot = stats
+            
+        for layer_name, layer_stats in layers_to_plot.items():
+            if "scaling_history" not in layer_stats:
+                print(f"{layer_name} does not use adaptive experts or has no scaling history.")
+                continue
+                
+            scaling_history = layer_stats["scaling_history"]
+            
+            # Create figure with subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+            
+            # Plot expert sizes over time
+            for i, expert_history in enumerate(scaling_history):
+                if not expert_history:
+                    continue
+                    
+                steps = [h['step'] for h in expert_history]
+                sizes = [h['new_size'] for h in expert_history]
+                importance = [h['importance'] for h in expert_history]
+                
+                ax1.plot(steps, sizes, 'o-', label=f'Expert {i}')
+                
+                # Add annotations for importance
+                for j, (x, y, imp) in enumerate(zip(steps, sizes, importance)):
+                    ax1.annotate(f"{imp:.2f}", (x, y), 
+                               xytext=(0, 5), textcoords='offset points',
+                               ha='center', va='bottom', fontsize=8)
+            
+            ax1.set_title(f"{layer_name} Expert Size Evolution")
+            ax1.set_xlabel("Training Step")
+            ax1.set_ylabel("Hidden Dimension")
+            ax1.legend()
+            ax1.grid(True, linestyle='--', alpha=0.7)
+            
+            # Plot current expert sizes and importance
+            expert_sizes = layer_stats["expert_sizes"]
+            importance = layer_stats["importance_scores"]
+            
+            x = np.arange(len(expert_sizes))
+            ax2.bar(x, expert_sizes, alpha=0.7, label='Hidden Dimension')
+            
+            # Add importance scores as line
+            ax2_twin = ax2.twinx()
+            ax2_twin.plot(x, importance, 'ro-', label='Importance')
+            
+            ax2.set_title(f"{layer_name} Current Expert Sizes and Importance")
+            ax2.set_xlabel("Expert Index")
+            ax2.set_ylabel("Hidden Dimension")
+            ax2_twin.set_ylabel("Importance Score")
+            
+            # Add legends for both axes
+            lines1, labels1 = ax2.get_legend_handles_labels()
+            lines2, labels2 = ax2_twin.get_legend_handles_labels()
+            ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+            
+            ax2.set_xticks(x)
+            ax2.grid(True, linestyle='--', alpha=0.7)
+            
+            plt.tight_layout()
+            plt.show()

@@ -30,6 +30,7 @@ SparseMoE is a high-performance language model implementation that uses a Sparse
 SparseMoE features Dynamic Neural Pathway Selection (DNPS), which selectively routes inputs to appropriate experts, activating only a small fraction of parameters per token. This architecture allows us to build larger models with better efficiency compared to dense models.
 
 Key features:
+- **Adaptive Expert Scaling** - Unique feature that dynamically adjusts expert capacity based on usage patterns
 - Hybrid C++/Python implementation design pattern (with mock C++ currently)
 - Dynamic Neural Pathway Selection for adaptive expert routing
 - Flexible attention mechanism with rotary position embeddings
@@ -56,6 +57,57 @@ SparseMoE consists of several key components:
    - Transformer blocks with attention and feed-forward layers
    - Dynamic Neural Pathway Selection (DNPS) for expert routing
    - Efficient attention with rotary position embeddings and KV caching
+   
+## Adaptive Expert Scaling
+
+One of the unique innovations in SparseMoE is the Adaptive Expert Scaling mechanism, which dynamically adjusts the capacity (parameter count) of each expert based on actual usage patterns:
+
+![Adaptive Experts](docs/adaptive_experts.jpg)
+
+### How It Works
+
+1. **Usage Tracking**: The system monitors which experts are activated for each token and their importance scores
+2. **Periodic Scaling**: At regular intervals, the system evaluates expert usage statistics
+3. **Resource Reallocation**: 
+   - Frequently used experts receive more parameters (larger hidden dimensions)
+   - Underutilized experts are reduced in size
+   - Total parameter count remains roughly constant, maintaining efficiency
+
+### Benefits
+
+- **Automatic Specialization**: Important experts gain more representational capacity
+- **Resource Efficiency**: Parameter budget is allocated where it provides most value
+- **Adaptation to Data**: Model structure evolves based on actual data patterns
+- **Dynamic Architecture**: Neural network shape changes during training
+
+### Usage
+
+```python
+from sparsemoe import SparseMoEConfig, SparseMoEModel
+
+# Create a model with adaptive experts
+config = SparseMoEConfig(
+    # ... other parameters ...
+    expert_type="adaptive",
+    adaptive_initial_dim=2048,
+    adaptive_min_dim=512,
+    adaptive_max_dim=4096,
+    adaptive_scaling_interval=1000
+)
+
+model = SparseMoEModel(config)
+
+# After training/inference, visualize expert scaling
+model.visualize_expert_scaling()
+
+# Get statistics about expert usage and scaling
+stats = model.get_expert_stats()
+```
+
+Try the adaptive experts demo:
+```bash
+python examples/adaptive_experts_demo.py
+```
 
 ## Getting Started
 
