@@ -6,6 +6,7 @@ SparseMoE is a high-performance language model implementation that uses a Sparse
 
 **What Works:**
 - Core model architecture with Dynamic Neural Pathway Selection
+- **Adaptive Expert Scaling** - unique feature that dynamically adjusts expert capacity
 - Mock C++ bindings for testing without CUDA
 - Model inference with various configurations
 - Basic text generation capabilities
@@ -62,7 +63,7 @@ SparseMoE consists of several key components:
 
 One of the unique innovations in SparseMoE is the Adaptive Expert Scaling mechanism, which dynamically adjusts the capacity (parameter count) of each expert based on actual usage patterns:
 
-![Adaptive Experts](docs/adaptive_experts.jpg)
+![Adaptive Experts](docs/adaptive_experts.md)
 
 ### How It Works
 
@@ -155,6 +156,7 @@ generated = model.generate(input_ids, max_new_tokens=10)
 **Model Architecture:**
 - ✅ Transformer-based architecture
 - ✅ Dynamic Neural Pathway Selection
+- ✅ **Adaptive Expert Scaling** (unique innovation)
 - ✅ Configurable model sizes and parameters
 - ✅ Attention with rotary position embeddings
 - ✅ KV caching for efficient inference
@@ -222,8 +224,9 @@ The current implementation focuses on core architecture components:
 
 1. **SparseMoEModel**: Base model with transformer layers
 2. **DNPSLayer**: Dynamic Neural Pathway Selection implementation
-3. **DynamicAttention**: Attention mechanism with rotary embeddings
-4. **Mock C++ Integration**: For testing the overall architecture
+3. **AdaptiveExpertLayer**: Unique system for dynamic expert capacity scaling
+4. **DynamicAttention**: Attention mechanism with rotary embeddings
+5. **Mock C++ Integration**: For testing the overall architecture
 
 ### Missing Features
 
@@ -246,15 +249,22 @@ python tests/py/run_tests.py
 
 # Test the mock C++ bindings specifically
 python test_mock_cpp.py
+
+# Test adaptive experts feature
+python tests/py/test_adaptive_experts.py
+
+# Run the adaptive experts demo
+python examples/adaptive_experts_demo.py
 ```
 
 ### Development Roadmap
 
-1. **Phase 1 (Current)**: Architecture implementation with mock C++
-2. **Phase 2**: Implement CUDA kernels for critical operations
-3. **Phase 3**: Training infrastructure and weight initialization
-4. **Phase 4**: Performance optimization and scaling tests
-5. **Phase 5**: Tokenizer integration and full model training
+1. **Phase 1 ✓**: Architecture implementation with mock C++
+2. **Phase 1.5 ✓**: Add innovative Adaptive Expert Scaling feature
+3. **Phase 2**: Implement CUDA kernels for critical operations
+4. **Phase 3**: Training infrastructure and weight initialization
+5. **Phase 4**: Performance optimization and scaling tests
+6. **Phase 5**: Tokenizer integration and full model training
 
 ## Known Issues
 
